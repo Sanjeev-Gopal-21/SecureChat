@@ -531,29 +531,3 @@ python server.py --port 5001
 3. **FIPS 180-4**: Secure Hash Standard
 4. **RSA Laboratories**: RSA Cryptography Standards
 5. **PyCryptodome Documentation**: https://pycryptodome.readthedocs.io/
-
----
-
-## License
-
-Educational use - BCY602 Course Assignment
-
-## Authors
-
-[Your Group Names and Roll Numbers]
-
-## Submission
-
-- **Deadline**: 11/05/2026
-- **Format**: Source code + README + Screenshots + Report
-- **Late Penalty**: 10% per day (max 3 days)
-
----
-
-## Support
-
-For issues or questions:
-1. Check the Troubleshooting section
-2. Review the error logs in `logs/`
-3. Check SECURITY_ANALYSIS.md for detailed security info
-4. Run tests: `python -m pytest tests/ -v`
