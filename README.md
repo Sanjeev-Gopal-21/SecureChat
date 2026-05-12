@@ -513,17 +513,6 @@ python server.py --port 5001
 | Error Handling | Try-catch with logging |
 | Secure Termination | Graceful shutdown |
 
-### Evaluation Criteria (25 Marks) ✓
-
-- **Algorithm Correctness (6 marks)**: Full RSA/AES implementation
-- **Hybrid Integration (5 marks)**: RSA for keys, AES for messages
-- **Network Functionality (4 marks)**: Working client-server
-- **Security Features (4 marks)**: Hash + HMAC implemented
-- **Code Quality (3 marks)**: Well-documented, modular
-- **Innovation (3 marks)**: Comprehensive error handling + logging
-
----
-
 ## References
 
 1. **NIST SP 800-38A**: Recommendation for Block Cipher Modes
