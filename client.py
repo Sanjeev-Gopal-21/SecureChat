@@ -1,502 +1,451 @@
 """
-Secure Chat Client
-Handles encryption, decryption, and secure communication with server
+Secure Chat Client — fully working hybrid-encryption chat client.
+
+Fixed bugs vs original:
+  1. KEY_EXCHANGE now includes from/to routing → server can relay correctly.
+  2. Server response (target's public key) is properly received and stored
+     → /session no longer fails with "Remote public key not set".
+  3. SESSION_KEY includes from/to routing → server relays to recipient.
+  4. Incoming SESSION_KEY is decrypted and stored automatically.
+  5. Chat messages include from/to routing → server relays to recipient.
+  6. Incoming messages are decrypted and verified correctly (JSON payload).
+  7. HMAC mismatch fixed in authentication.py (protect uses timestamp HMAC).
+  8. self.running=True set before interactive_chat starts (race condition fixed).
+  9. Recv buffer properly handles TCP fragmentation and mixed JSON/binary data.
+ 10. Logging configured per-instance without polluting root logger.
 """
 
 import socket
 import threading
 import json
+import struct
 import uuid
 import logging
-import time
+import os
+import base64
 from datetime import datetime
 
-from key_exchange import KeyExchange, generate_session_key
-from encryption import SymmetricEncryption
-from authentication import Hashing, Authentication, MessageIntegrity
-from message_protocol import Message, MessageType, KeyExchangeMessage, SessionKeyMessage, ChatMessage
+from key_exchange  import KeyExchange, generate_session_key
+from encryption    import SymmetricEncryption
+from authentication import MessageIntegrity
+from message_protocol import (Message, MessageType,
+                               KeyExchangeMessage, SessionKeyMessage,
+                               ChatMessage, ControlMessage)
 
 
 class ChatClient:
-    """
-    Secure chat client with hybrid encryption.
-    
-    Protocol flow:
-    1. Connect to server
-    2. Generate RSA-2048 key pair
-    3. Exchange public keys with other clients
-    4. Generate and exchange AES-256 session key
-    5. Exchange encrypted messages
-    """
-    
     def __init__(self, username, host='localhost', port=5000):
-        """
-        Initialize chat client.
-        
-        Args:
-            username (str): Username for this client
-            host (str): Server host
-            port (int): Server port
-        """
-        self.username = username
-        self.host = host
-        self.port = port
-        self.client_id = str(uuid.uuid4())[:8]
-        
-        # Cryptography components
-        self.key_exchange = KeyExchange(username)
-        self.symmetric_enc = None
-        self.session_key = None
-        
-        # Remote user information
-        self.remote_public_key = None
-        self.remote_username = None
-        
-        # Connection
-        self.socket = None
+        self.username       = username
+        self.host           = host
+        self.port           = port
+        self.client_id      = str(uuid.uuid4())[:8]
+
+        # crypto
+        self.key_exchange   = KeyExchange(username)
+        self.symmetric_enc  = None
+        self.session_key    = None
+
+        # peer
+        self.remote_public_key = None   # RSA key object
+        self.remote_username   = None
+
+        # network
+        self.socket    = None
         self.connected = False
-        self.running = False
-        
-        # Setup logging
-        self.logger = self._setup_logging()
-    
-    def _setup_logging(self):
-        """Setup logging for client."""
-        logging.basicConfig(
-            level=logging.INFO,
-            format=f'[{self.username}] %(asctime)s - %(message)s',
-            handlers=[
-                logging.FileHandler(f'client_{self.username}.log'),
-                logging.StreamHandler()
-            ]
-        )
-        return logging.getLogger(f'ChatClient_{self.username}')
-    
+        self.running   = False          # set True before interactive_chat
+
+        os.makedirs('logs', exist_ok=True)
+        self.logger = self._make_logger()
+
+    # ── logging ───────────────────────────────────────────────────────────────
+    def _make_logger(self):
+        log = logging.getLogger(f'Client_{self.username}_{self.client_id}')
+        log.setLevel(logging.INFO)
+        if not log.handlers:
+            fh = logging.FileHandler(f'logs/client_{self.username}.log')
+            fh.setFormatter(logging.Formatter(
+                f'[{self.username}] %(asctime)s - %(message)s'))
+            log.addHandler(fh)
+        return log
+
+    # ── setup & connect ───────────────────────────────────────────────────────
     def setup_encryption(self):
-        """
-        Setup cryptography for this client.
-        
-        Generates RSA key pair if not exists.
-        """
         print(f"\n[*] Setting up encryption for {self.username}...")
-        
-        # Try to load existing keys
         if not self.key_exchange.load_keys():
-            # Generate new keys
             self.key_exchange.generate_keypair()
-        
-        # Validate keys
         if not self.key_exchange.validate_keys():
-            raise Exception("Key validation failed!")
-        
+            raise RuntimeError("Key validation failed!")
         print(f"[✓] Encryption setup complete")
-    
+
     def connect_to_server(self):
-        """
-        Connect to the chat server.
-        
-        Returns:
-            bool: True if connection successful
-        """
         try:
             print(f"\n[*] Connecting to server at {self.host}:{self.port}...")
-            
             self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.socket.connect((self.host, self.port))
             self.connected = True
-            
             print(f"[✓] Connected to server")
-            self.logger.info(f"Connected to server at {self.host}:{self.port}")
-            
-            # Send client info to server
-            client_info = {
-                'username': self.username,
-                'client_id': self.client_id
-            }
-            self.socket.sendall(json.dumps(client_info).encode('utf-8'))
-            
-            # Start message receiver thread
-            receiver_thread = threading.Thread(target=self._receive_messages, daemon=True)
-            receiver_thread.start()
-            
+            self.logger.info(f"Connected to {self.host}:{self.port}")
+
+            # Send handshake (JSON line)
+            handshake = json.dumps(
+                {'username': self.username, 'client_id': self.client_id}
+            ) + '\n'
+            self.socket.sendall(handshake.encode('utf-8'))
+
+            # Start background receiver BEFORE interactive_chat
+            self.running = True
+            t = threading.Thread(target=self._recv_loop, daemon=True)
+            t.start()
             return True
-        
+
         except Exception as e:
             print(f"[✗] Connection failed: {e}")
             self.logger.error(f"Connection failed: {e}")
             return False
-    
+
+    # ── key exchange ──────────────────────────────────────────────────────────
     def exchange_keys_with_remote(self, remote_username):
         """
-        Exchange public keys with a remote user.
-        
-        Args:
-            remote_username (str): Username of remote user
-        
-        Returns:
-            bool: True if key exchange successful
+        Send our public key to the server, tagged with from/to so the server
+        can (a) relay it to the target and (b) send the target's key back to us.
         """
         try:
             print(f"\n[*] Initiating key exchange with {remote_username}...")
-            
-            # Send own public key to server
-            public_key_pem = self.key_exchange.get_public_key_pem()
-            key_msg = KeyExchangeMessage.create(public_key_pem)
-            
-            self.socket.sendall(key_msg.serialize())
-            print(f"[✓] Public key sent to server")
-            
-            # For this demo, we'll manually handle receiving remote's key
-            # In production, server would relay this
             self.remote_username = remote_username
-            
-            return True
-        
+
+            msg = KeyExchangeMessage.create(
+                sender         = self.username,
+                target         = remote_username,
+                public_key_pem = self.key_exchange.get_public_key_pem()
+            )
+            self.socket.sendall(msg.serialize())
+            print(f"[✓] Public key sent to server (routed to {remote_username})")
+
         except Exception as e:
             print(f"[✗] Key exchange failed: {e}")
             self.logger.error(f"Key exchange error: {e}")
-            return False
-    
-    def set_remote_public_key(self, remote_public_key_pem):
+
+    # ── session key ───────────────────────────────────────────────────────────
+    def establish_session_key(self, remote_username=None):
         """
-        Set the remote user's public key.
-        
-        Args:
-            remote_public_key_pem (str): Remote public key in PEM format
+        Generate AES-256 session key, encrypt with remote's RSA public key,
+        send to server — server relays to remote.
+        Call AFTER remote_public_key has been received from the key exchange.
         """
-        try:
-            self.remote_public_key = self.key_exchange.import_public_key(remote_public_key_pem)
-            print(f"[✓] Remote public key received and validated")
-        except Exception as e:
-            print(f"[✗] Error setting remote public key: {e}")
-            raise
-    
-    def establish_session_key(self):
-        """
-        Establish AES-256 session key with remote user.
-        
-        Process:
-        1. Generate random session key
-        2. Encrypt with remote's public key
-        3. Send to server
-        4. Server relays to remote
-        """
+        if remote_username:
+            self.remote_username = remote_username
+
         if self.remote_public_key is None:
-            raise ValueError("Remote public key not set. Exchange keys first.")
-        
+            print("[!] Remote public key not yet received. "
+                  "Wait for key exchange to complete first.")
+            return False
+
         try:
             print(f"\n[*] Establishing session key with {self.remote_username}...")
-            
-            # Generate random session key
             self.session_key = generate_session_key()
-            
-            # Encrypt with remote's public key
-            encrypted_key = self.key_exchange.encrypt_session_key(
+
+            encrypted = self.key_exchange.encrypt_session_key(
                 self.session_key,
                 self.remote_public_key.export_key('PEM').decode('utf-8')
             )
-            
-            # Create and send session key message
-            session_msg = SessionKeyMessage.create(encrypted_key)
-            self.socket.sendall(session_msg.serialize())
-            
-            # Setup symmetric encryption
-            self.symmetric_enc = SymmetricEncryption(self.session_key)
-            
-            print(f"[✓] Session key established and ready for encrypted messaging")
-            self.logger.info(f"Session key established with {self.remote_username}")
-            
-        except Exception as e:
-            print(f"[✗] Session key establishment failed: {e}")
-            self.logger.error(f"Session key error: {e}")
-            raise
-    
-    def receive_session_key(self, encrypted_session_key):
-        """
-        Receive and decrypt session key from remote user.
-        
-        Args:
-            encrypted_session_key (bytes): RSA-encrypted session key
-        """
-        try:
-            print(f"\n[*] Receiving session key from {self.remote_username}...")
-            
-            # Decrypt with own private key
-            self.session_key = self.key_exchange.decrypt_session_key(encrypted_session_key)
-            
-            # Setup symmetric encryption
-            self.symmetric_enc = SymmetricEncryption(self.session_key)
-            
-            print(f"[✓] Session key received and decrypted")
-            self.logger.info(f"Session key received from {self.remote_username}")
-        
-        except Exception as e:
-            print(f"[✗] Session key reception failed: {e}")
-            self.logger.error(f"Session key reception error: {e}")
-            raise
-    
-    def send_message(self, plaintext):
-        """
-        Send an encrypted, authenticated message.
-        
-        Process:
-        1. Compute SHA-256 hash (integrity)
-        2. Compute HMAC-SHA256 (authentication)
-        3. Encrypt with AES-256-CBC
-        4. Create message packet
-        5. Send to server
-        
-        Args:
-            plaintext (str): Message to send
-        
-        Returns:
-            bool: True if send successful
-        """
-        if self.symmetric_enc is None:
-            print(f"[✗] Session not established. Establish session key first.")
-            return False
-        
-        try:
-            if isinstance(plaintext, str):
-                plaintext = plaintext.encode('utf-8')
-            
-            print(f"\n[*] Encrypting and sending message...")
-            
-            # Compute integrity and authentication
-            protection = MessageIntegrity.protect_message(plaintext, self.session_key)
-            
-            # Encrypt message
-            iv, ciphertext = self.symmetric_enc.encrypt(plaintext)
-            
-            # Create chat message
-            chat_msg = ChatMessage.create(
-                iv + ciphertext,  # Combined IV + ciphertext
-                protection['hash'],
-                protection['hmac'],
-                iv
+
+            msg = SessionKeyMessage.create(
+                sender             = self.username,
+                target             = self.remote_username,
+                encrypted_key_bytes= encrypted
             )
-            
-            # Serialize and send
-            serialized = chat_msg.serialize()
-            self.socket.sendall(serialized)
-            
-            print(f"[✓] Message sent ({len(serialized)} bytes)")
-            self.logger.info(f"Message sent to {self.remote_username} ({len(serialized)} bytes)")
-            
+            self.socket.sendall(msg.serialize())
+
+            self.symmetric_enc = SymmetricEncryption(self.session_key)
+            print(f"[✓] Session key sent to {self.remote_username}")
+            print(f"[✓] AES-256 encryption READY — you can now send messages")
+            self.logger.info(f"Session key established with {self.remote_username}")
             return True
-        
+
         except Exception as e:
-            print(f"[✗] Error sending message: {e}")
+            print(f"[!] Session key establishment failed: {e}")
+            self.logger.error(f"Session key error: {e}")
+            return False
+
+    # ── send message ──────────────────────────────────────────────────────────
+    def send_message(self, plaintext_str):
+        if not self.connected:
+            print("[!] Not connected to server")
+            return False
+        if self.symmetric_enc is None:
+            print("[!] No session established. Use /session <username> first.")
+            return False
+        if not self.remote_username:
+            print("[!] No remote user set. Use /remote <username> first.")
+            return False
+
+        try:
+            plaintext = plaintext_str.encode('utf-8')
+
+            # Integrity + authentication
+            protection = MessageIntegrity.protect_message(plaintext, self.session_key)
+
+            # Encrypt
+            iv, ciphertext = self.symmetric_enc.encrypt(plaintext)
+
+            # Build and send
+            msg = ChatMessage.create(
+                sender    = self.username,
+                target    = self.remote_username,
+                iv        = iv,
+                ciphertext= ciphertext,
+                msg_hash  = protection['hash'],
+                hmac_val  = protection['hmac'],
+                timestamp = protection['timestamp'],
+            )
+            self.socket.sendall(msg.serialize())
+            print(f"[✓] Encrypted message sent to {self.remote_username}")
+            self.logger.info(f"Message sent to {self.remote_username}")
+            return True
+
+        except Exception as e:
+            print(f"[!] Send error: {e}")
             self.logger.error(f"Send error: {e}")
             return False
-    
-    def _receive_messages(self):
-        """
-        Background thread for receiving messages from server.
-        """
-        self.running = True
-        
+
+    # ── receiver loop ─────────────────────────────────────────────────────────
+    def _recv_loop(self):
+        buf = b''
         while self.running and self.connected:
             try:
-                # Receive message header first (at least 100 bytes)
-                data = b''
-                while len(data) < Message.MIN_MESSAGE_SIZE:
-                    chunk = self.socket.recv(4096)
-                    if not chunk:
-                        self.connected = False
-                        print(f"\n[!] Connection closed by server")
-                        return
-                    data += chunk
-                
-                # Deserialize
-                msg = Message.deserialize(data)
-                
-                # Handle based on type
-                if msg.msg_type == MessageType.MESSAGE:
-                    self._handle_received_message(msg)
-                elif msg.msg_type == MessageType.KEY_EXCHANGE:
-                    self._handle_key_exchange_message(msg)
-                elif msg.msg_type == MessageType.SESSION_KEY:
-                    self._handle_session_key_message(msg)
-                elif msg.msg_type == MessageType.ACK:
-                    print(f"[✓] Acknowledgement received")
-            
+                chunk = self.socket.recv(4096)
+                if not chunk:
+                    self.connected = False
+                    print("\n[!] Connection closed by server")
+                    return
+                buf += chunk
+
+                while buf:
+                    # JSON line from server (online-users broadcast)?
+                    if buf[0:1] == b'{':
+                        nl = buf.find(b'\n')
+                        if nl == -1:
+                            break   # incomplete — wait for more
+                        self._on_json(buf[:nl])
+                        buf = buf[nl+1:]
+                        continue
+
+                    # Binary Message packet
+                    if len(buf) < Message.MIN_MESSAGE_SIZE:
+                        break
+                    payload_len = struct.unpack('<I', buf[1:5])[0]
+                    full_size   = Message.MIN_MESSAGE_SIZE + payload_len
+                    if len(buf) < full_size:
+                        break
+
+                    packet = buf[:full_size]
+                    buf    = buf[full_size:]
+
+                    try:
+                        msg = Message.deserialize(packet)
+                        self._dispatch(msg)
+                    except Exception as e:
+                        self.logger.error(f"Deserialize error: {e}")
+
+            except (ConnectionResetError, ConnectionAbortedError, OSError) as e:
+                if self.running:
+                    print(f"\n[!] Connection lost: {e}")
+                self.connected = False
+                return
             except Exception as e:
                 if self.running:
-                    self.logger.error(f"Receive error: {e}")
-                    # Don't print error for normal disconnection
-                    if "Connection" not in str(e):
-                        print(f"[!] Error receiving: {e}")
-    
-    def _handle_received_message(self, msg):
-        """Handle received chat message."""
+                    self.logger.error(f"Recv error: {e}")
+
+    def _dispatch(self, msg):
+        if   msg.msg_type == MessageType.KEY_EXCHANGE: self._on_key_exchange(msg)
+        elif msg.msg_type == MessageType.SESSION_KEY:  self._on_session_key(msg)
+        elif msg.msg_type == MessageType.MESSAGE:      self._on_message(msg)
+        elif msg.msg_type == MessageType.ACK:
+            self.logger.info("ACK received")
+        else:
+            self.logger.warning(f"Unknown msg type: {msg.msg_type}")
+
+    # ── incoming KEY_EXCHANGE ─────────────────────────────────────────────────
+    def _on_key_exchange(self, msg):
+        """Receive the remote user's public key from the server."""
+        try:
+            data   = KeyExchangeMessage.parse(msg)
+            sender = data['from']
+            if sender == self.username:
+                return   # echo of own key — ignore
+            pub_key_pem = data['public_key']
+            self.remote_public_key = self.key_exchange.import_public_key(pub_key_pem)
+            if not self.remote_username:
+                self.remote_username = sender
+            print(f"\n[✓] Received public key from {sender}")
+            print(f"    You can now run:  /session {sender}")
+            print(f"[{self.username}] > ", end='', flush=True)
+        except Exception as e:
+            self.logger.error(f"Key exchange receive error: {e}")
+
+    # ── incoming SESSION_KEY ──────────────────────────────────────────────────
+    def _on_session_key(self, msg):
+        """Receive and decrypt the RSA-encrypted AES session key."""
+        try:
+            data           = SessionKeyMessage.parse(msg)
+            sender         = data['from']
+            encrypted_key  = data['encrypted_key']
+
+            self.session_key = self.key_exchange.decrypt_session_key(encrypted_key)
+            self.symmetric_enc = SymmetricEncryption(self.session_key)
+
+            if not self.remote_username:
+                self.remote_username = sender
+            print(f"\n[✓] Session key received from {sender}")
+            print(f"[✓] AES-256 encryption READY — you can now send messages")
+            print(f"[{self.username}] > ", end='', flush=True)
+            self.logger.info(f"Session key received from {sender}")
+        except Exception as e:
+            self.logger.error(f"Session key receive error: {e}")
+            print(f"\n[!] Failed to receive session key: {e}")
+            print(f"[{self.username}] > ", end='', flush=True)
+
+    # ── incoming MESSAGE ──────────────────────────────────────────────────────
+    def _on_message(self, msg):
+        """Decrypt, verify, and display an incoming encrypted message."""
         try:
             if self.symmetric_enc is None:
-                print(f"[!] Received message but session not established")
+                print("\n[!] Received message but no session established")
                 return
-            
-            content = ChatMessage.extract_content(msg)
-            
-            print(f"\n[*] Decrypting received message...")
-            
+
+            data       = ChatMessage.parse(msg)
+            sender     = data['from']
+            iv         = data['iv']
+            ciphertext = data['ciphertext']
+            protection = {
+                'hash':      data['hash'],
+                'hmac':      data['hmac'],
+                'timestamp': data['timestamp'],
+            }
+
             # Decrypt
-            plaintext = self.symmetric_enc.decrypt(
-                content['iv'],
-                content['encrypted_content'][len(content['iv']):]
-            )
-            
-            # Verify integrity and authentication
-            if not MessageIntegrity.verify_message(plaintext, content, self.session_key):
-                print(f"[✗] Message verification failed - ignoring message!")
+            plaintext = self.symmetric_enc.decrypt(iv, ciphertext)
+
+            # Verify integrity + authentication
+            if not MessageIntegrity.verify_message(plaintext, protection, self.session_key):
+                print(f"\n[✗] Message from {sender} FAILED verification — discarded!")
+                print(f"[{self.username}] > ", end='', flush=True)
                 return
-            
-            # Display message
-            print(f"\n{self.remote_username}: {plaintext.decode('utf-8')}")
+
+            print(f"\n{sender}: {plaintext.decode('utf-8')}")
             print(f"[{self.username}] > ", end='', flush=True)
-        
+            self.logger.info(f"Message received from {sender}")
+
         except Exception as e:
-            self.logger.error(f"Message handling error: {e}")
-            print(f"[!] Error handling received message: {e}")
-    
-    def _handle_key_exchange_message(self, msg):
-        """Handle key exchange message."""
+            self.logger.error(f"Message receive error: {e}")
+            print(f"\n[!] Error receiving message: {e}")
+            print(f"[{self.username}] > ", end='', flush=True)
+
+    # ── JSON control messages (online users broadcast) ────────────────────────
+    def _on_json(self, data: bytes):
         try:
-            remote_key_pem = KeyExchangeMessage.extract_public_key(msg)
-            self.set_remote_public_key(remote_key_pem)
-            print(f"\n[✓] Remote public key received")
+            payload = json.loads(data.decode('utf-8'))
+            if payload.get('type') == 'online_users':
+                names = [u['username'] for u in payload.get('users', [])]
+                print(f"\n[*] Online users: {', '.join(names) if names else 'none'}")
+                print(f"[{self.username}] > ", end='', flush=True)
         except Exception as e:
-            self.logger.error(f"Key exchange message error: {e}")
-    
-    def _handle_session_key_message(self, msg):
-        """Handle session key message."""
-        try:
-            encrypted_key = SessionKeyMessage.extract_encrypted_key(msg)
-            self.receive_session_key(encrypted_key)
-        except Exception as e:
-            self.logger.error(f"Session key message error: {e}")
-    
+            self.logger.error(f"JSON parse error: {e}")
+
+    # ── interactive loop ──────────────────────────────────────────────────────
     def interactive_chat(self):
-        """
-        Interactive chat loop for user input.
-        """
         print(f"\n{'='*50}")
-        print(f"  Secure Chat - {self.username}")
+        print(f"  Secure Chat — {self.username}")
         print(f"{'='*50}")
-        print(f"Commands:")
-        print(f"  /key <username>     - Exchange keys")
-        print(f"  /session <username> - Establish session (after key exchange)")
-        print(f"  /remote <username>  - Set remote user")
-        print(f"  /status             - Show status")
-        print(f"  /quit               - Exit")
+        print("Commands:")
+        print("  /key <user>     — exchange public keys")
+        print("  /session <user> — establish encrypted session")
+        print("  /remote <user>  — set chat partner")
+        print("  /status         — show current status")
+        print("  /quit           — exit")
         print(f"{'='*50}\n")
-        
+
         while self.running:
             try:
-                user_input = input(f"[{self.username}] > ").strip()
-                
-                if not user_input:
+                line = input(f"[{self.username}] > ").strip()
+                if not line:
                     continue
-                
-                if user_input.startswith('/'):
-                    self._handle_command(user_input)
+                if line.startswith('/'):
+                    self._command(line)
                 else:
-                    # Send message
-                    self.send_message(user_input)
-            
+                    self.send_message(line)
             except KeyboardInterrupt:
-                print(f"\n[*] Chat interrupted")
+                print("\n[*] Interrupted")
                 break
             except EOFError:
                 break
             except Exception as e:
                 print(f"[!] Error: {e}")
-    
-    def _handle_command(self, command):
-        """Handle user commands."""
-        parts = command.split()
-        cmd = parts[0].lower()
-        
+
+    def _command(self, line):
+        parts = line.split()
+        cmd   = parts[0].lower()
+
         if cmd == '/key' and len(parts) > 1:
-            remote_user = parts[1]
-            self.exchange_keys_with_remote(remote_user)
-        
+            self.exchange_keys_with_remote(parts[1])
+
         elif cmd == '/session' and len(parts) > 1:
-            remote_user = parts[1]
-            self.remote_username = remote_user
-            try:
-                self.establish_session_key()
-            except Exception as e:
-                print(f"[!] Session establishment failed: {e}")
-        
+            self.establish_session_key(parts[1])
+
         elif cmd == '/remote' and len(parts) > 1:
             self.remote_username = parts[1]
             print(f"[✓] Remote user set to: {self.remote_username}")
-        
+
         elif cmd == '/status':
-            self._show_status()
-        
+            print(f"\n{'─'*40}")
+            print(f"  User      : {self.username} ({self.client_id})")
+            print(f"  Connected : {self.connected}")
+            print(f"  Remote    : {self.remote_username or 'not set'}")
+            rk = "received ✓" if self.remote_public_key else "not received"
+            print(f"  Remote key: {rk}")
+            sk = "established ✓" if self.session_key else "not established"
+            print(f"  Session   : {sk}")
+            print(f"{'─'*40}\n")
+
         elif cmd == '/quit':
-            print(f"[*] Exiting...")
+            print("[*] Exiting...")
             self.running = False
             self.disconnect()
-        
+
         else:
-            print(f"[!] Unknown command: {cmd}")
-    
-    def _show_status(self):
-        """Show client status."""
-        print(f"\n{'─'*40}")
-        print(f"Status: {self.username} ({self.client_id})")
-        print(f"Connected: {self.connected}")
-        print(f"Remote User: {self.remote_username or 'Not set'}")
-        print(f"Session Established: {self.session_key is not None}")
-        if self.session_key:
-            print(f"Session Key: {self.session_key[:8].hex().upper()}...")
-        print(f"{'─'*40}\n")
-    
+            print(f"[!] Unknown command. Try /key, /session, /remote, /status, /quit")
+
     def disconnect(self):
-        """Disconnect from server."""
         try:
-            if self.socket:
+            if self.socket and self.connected:
+                disc = ControlMessage.create_disconnect(self.username)
+                try: self.socket.sendall(disc.serialize())
+                except: pass
                 self.socket.close()
             self.connected = False
-            self.running = False
-            print(f"[✓] Disconnected from server")
-            self.logger.info("Disconnected from server")
+            self.running   = False
+            print("[✓] Disconnected from server")
+            self.logger.info("Disconnected")
         except Exception as e:
             self.logger.error(f"Disconnect error: {e}")
 
 
 def main():
-    """Main client entry point."""
     import argparse
-    
-    parser = argparse.ArgumentParser(description='Secure Chat Client')
-    parser.add_argument('--username', required=True, help='Your username')
-    parser.add_argument('--host', default='localhost', help='Server host')
-    parser.add_argument('--port', type=int, default=5000, help='Server port')
-    
-    args = parser.parse_args()
-    
-    # Create client
+    p = argparse.ArgumentParser(description='Secure Chat Client')
+    p.add_argument('--username', required=True)
+    p.add_argument('--host',    default='localhost')
+    p.add_argument('--port',    type=int, default=5000)
+    args = p.parse_args()
+
     client = ChatClient(args.username, args.host, args.port)
-    
     try:
-        # Setup encryption
         client.setup_encryption()
-        
-        # Connect to server
         if not client.connect_to_server():
             return
-        
-        # Start interactive chat
         client.interactive_chat()
-    
     except KeyboardInterrupt:
-        print(f"\n[!] Client interrupted")
-    except Exception as e:
-        print(f"[✗] Error: {e}")
-    
+        print("\n[!] Interrupted")
     finally:
         client.disconnect()
 
